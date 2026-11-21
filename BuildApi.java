@@ -2,6 +2,7 @@ import javax.lang.model.SourceVersion;
 
 private static final Pattern REQUEST = Pattern.compile("([A-Z]+)\\s+(.+?)(?:\\s+HTTP/\\S+)?");
 private static final Pattern VARIABLE = Pattern.compile("\\{\\{\\s*([\\w.-]+)\\s*}}");
+private static final Pattern INSTANCE_VARIABLE = Pattern.compile("@([\\w.-]+)\\s*=.*;\\s*instance");
 private static final Pattern RESPONSE = Pattern.compile(
         "(?:#|//)?\\s*@response\\s*([A-Z][\\w]*)?\\(([^()]*)\\)");
 private static final Pattern RESPONSE_COMPONENT = Pattern.compile(
@@ -30,11 +31,13 @@ void main(String[] args) throws Exception {
     if (Files.exists(output) && Files.isSameFile(source, output)) {
         throw new IllegalArgumentException("Input and output must be different files");
     }
-    Files.writeString(output, generate(className, parse(Files.readString(source))));
+    var instanceVariables = new HashSet<String>();
+    var endpoints = parse(Files.readString(source), instanceVariables);
+    Files.writeString(output, generate(className, endpoints, instanceVariables));
     IO.println(output);
 }
 
-private static List<Endpoint> parse(String source) {
+private static List<Endpoint> parse(String source, Set<String> instanceVariables) {
     var endpoints = new ArrayList<Endpoint>();
     String[] sections = source.replaceFirst("^\\uFEFF", "").split("(?m)^###(?=\\s|$)", -1);
     for (int section = 0; section < sections.length; section++) {
@@ -44,7 +47,10 @@ private static List<Endpoint> parse(String source) {
         var responses = new ArrayList<ResponseRecord>();
         while (index < lines.length) {
             String line = lines[index].strip();
-            if (line.startsWith("={%")) {
+            var instanceVariable = INSTANCE_VARIABLE.matcher(line);
+            if (instanceVariable.matches()) {
+                instanceVariables.add(instanceVariable.group(1));
+            } else if (line.startsWith("={%")) {
                 while (!lines[index].contains("%}")) {
                     if (++index == lines.length) {
                         throw new IllegalArgumentException("Unclosed shared HTTP script block");
@@ -114,7 +120,8 @@ private static boolean isResponseHandler(String line) {
     return line.stripLeading().startsWith("> ");
 }
 
-private static String generate(String className, List<Endpoint> endpoints) {
+private static String generate(String className, List<Endpoint> endpoints,
+                               Set<String> instanceVariables) {
     var java = new StringBuilder("""
             import java.io.IOException;
             import java.net.URI;
@@ -141,14 +148,20 @@ private static String generate(String className, List<Endpoint> endpoints) {
     java.append("""
                     this.client = Objects.requireNonNull(client);
                     this.variables = Map.copyOf(variables);
-                }
             """);
+    int constructorEnd = java.length();
+    java.append("    }\n");
+    var instanceUris = new LinkedHashMap<String, String>();
     var names = new HashSet<>(Set.of("variable", "encode", "hashCode", "toString", "clone",
             "finalize", "getClass", "notify", "notifyAll", "wait"));
     var typeNames = new HashSet<>(Set.of(className));
     for (Endpoint endpoint : endpoints) {
-        appendEndpoint(java, endpoint, names, typeNames);
+        appendEndpoint(java, endpoint, names, typeNames, instanceVariables, instanceUris);
     }
+    var assignments = new StringBuilder();
+    instanceUris.forEach((url, field) -> assignments.append("        this.").append(field)
+            .append(" = URI.create(").append(template(url, true)).append(");\n"));
+    java.insert(constructorEnd, assignments);
     return java.append("""
             
                 private String variable(String name) {
@@ -167,7 +180,8 @@ private static String generate(String className, List<Endpoint> endpoints) {
 }
 
 private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<String> names,
-                                   Set<String> typeNames) {
+                                   Set<String> typeNames, Set<String> instanceVariables,
+                                   Map<String, String> instanceUris) {
     String label = endpoint.title().isBlank() ? endpoint.method() + " " + endpoint.url() : endpoint.title();
     String methodName = unique(identifier(label), names);
     String recordName = unique(capitalize(methodName) + "Request", typeNames);
@@ -227,10 +241,19 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     String responseType = endpoint.responses().isEmpty() ? null
             : unique(capitalize(methodName) + "Response", typeNames);
     boolean variableUrl = VARIABLE.matcher(baseUrl).find();
+    boolean instanceUrl = variableUrl && VARIABLE.matcher(baseUrl).results()
+            .allMatch(match -> instanceVariables.contains(match.group(1)));
     String uriField = methodName.replaceAll("([a-z0-9])([A-Z])", "$1_$2")
                               .toUpperCase(Locale.ROOT) + "_URI";
     String uriExpression = "URI.create(" + template(baseUrl, true) + ")";
-    if (variableUrl) {
+    if (instanceUrl) {
+        uriField = instanceUris.get(baseUrl);
+        if (uriField == null) {
+            uriField = methodName + "Uri";
+            instanceUris.put(baseUrl, uriField);
+            java.append("\n    private final URI ").append(uriField).append(";\n");
+        }
+    } else if (variableUrl) {
         uriField = methodName + "Uri";
         java.append("\n    private volatile URI ").append(uriField).append(";\n");
     } else {
@@ -250,7 +273,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
             .append(recordName).append(" arguments) throws IOException, InterruptedException {\n");
     java.append("        Objects.requireNonNull(arguments);\n");
     String requestUri = uriField;
-    if (variableUrl) {
+    if (variableUrl && !instanceUrl) {
         java.append("        URI uri = ").append(uriField).append(";\n")
                 .append("        if (uri == null) {\n")
                 .append("            uri = ").append(uriExpression).append(";\n")
