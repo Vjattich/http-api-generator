@@ -39,7 +39,7 @@ void main(String[] args) throws Exception {
 
 private static List<Endpoint> parse(String source, Set<String> instanceVariables) {
     var endpoints = new ArrayList<Endpoint>();
-    String[] sections = source.replaceFirst("^\\uFEFF", "").split("(?m)^###(?=\\s|$)", -1);
+    String[] sections = source.replaceFirst("^\\uFEFF", "").split("(?m)^###", -1);
     for (int section = 0; section < sections.length; section++) {
         String[] lines = sections[section].split("\\R", -1);
         String title = section == 0 ? "" : lines[0].strip();
@@ -195,8 +195,8 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
         }
     }
     var params = new ArrayList<String>();
+    var fieldParameters = new LinkedHashMap<String, String>();
     var queryFields = new ArrayList<String>();
-    var queryParameters = new ArrayList<String>();
     var fields = new ArrayList<String>();
     var paramNames = new HashSet<>(Set.of("clone", "finalize", "getClass", "hashCode",
             "notify", "notifyAll", "toString", "wait"));
@@ -212,11 +212,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
             if (field.isEmpty()) {
                 continue;
             }
-            String key = URLDecoder.decode(field.split("=", 2)[0], StandardCharsets.UTF_8);
-            String parameter = unique(identifier(key), paramNames);
-            params.add("String " + parameter);
-            queryFields.add(URLEncoder.encode(key, StandardCharsets.UTF_8) + "=");
-            queryParameters.add(parameter);
+            queryFields.add(parameterField(field, params, paramNames, fieldParameters, true));
         }
         if (queryFields.isEmpty()) {
             baseUrl = url;
@@ -225,11 +221,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     String publisher = "HttpRequest.BodyPublishers.noBody()";
     if (form && !endpoint.body().isEmpty()) {
         for (String field : endpoint.body().split("&", -1)) {
-            String key = URLDecoder.decode(field.split("=", 2)[0], StandardCharsets.UTF_8);
-            String parameter = unique(identifier(key), paramNames);
-            params.add("String " + parameter);
-            fields.add(literal(URLEncoder.encode(key, StandardCharsets.UTF_8) + "=")
-                       + " + encode(arguments." + parameter + "())");
+            fields.add(parameterField(field, params, paramNames, fieldParameters, false));
         }
         publisher = "HttpRequest.BodyPublishers.ofString(\n                        "
                     + String.join("\n                        + \"&\" + ", fields) + ")";
@@ -283,15 +275,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     }
     if (!queryFields.isEmpty()) {
         java.append("        StringJoiner query = new StringJoiner(\"&\");\n");
-        for (int index = 0; index < queryFields.size(); index++) {
-            String parameter = queryParameters.get(index);
-            java.append("        String ").append("queryValue").append(index)
-                    .append(" = arguments.").append(parameter).append("();\n")
-                    .append("        if (queryValue").append(index).append(" != null) {\n")
-                    .append("            query.add(").append(literal(queryFields.get(index)))
-                    .append(" + encode(queryValue").append(index).append(").replace(\"+\", \"%20\"));\n")
-                    .append("        }\n");
-        }
+        queryFields.forEach(java::append);
         String suffix = fragment.isEmpty() ? "" : " + " + template(fragment, true);
         java.append("        URI requestUri = query.length() == 0")
                 .append(fragment.isEmpty() ? " ? " + requestUri : " ? URI.create(" + requestUri + suffix + ")")
@@ -311,6 +295,45 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     java.append("        return client.send(request, HttpResponse.BodyHandlers.ofString());\n    }\n");
 }
 
+private static String parameterField(String field, List<String> params, Set<String> paramNames,
+                                     Map<String, String> fieldParameters, boolean query) {
+    var matcher = VARIABLE.matcher(field);
+    var expressions = new ArrayList<String>();
+    var arguments = new LinkedHashSet<String>();
+    int end = 0;
+    while (matcher.find()) {
+        if (matcher.start() > end) {
+            expressions.add(literal(field.substring(end, matcher.start())));
+        }
+        String variable = matcher.group(1);
+        String base = SourceVersion.isIdentifier(variable) && !SourceVersion.isKeyword(variable)
+                ? variable : identifier(variable);
+        String parameter = fieldParameters.computeIfAbsent(variable, key -> {
+            String name = unique(base, paramNames);
+            params.add("String " + name);
+            return name;
+        });
+        String argument = "arguments." + parameter + "()";
+        arguments.add(argument);
+        String encoded = "encode(" + argument + ")";
+        expressions.add(query ? encoded + ".replace(\"+\", \"%20\")" : encoded);
+        end = matcher.end();
+    }
+    if (end < field.length() || expressions.isEmpty()) {
+        expressions.add(literal(field.substring(end)));
+    }
+    String expression = String.join(" + ", expressions);
+    if (!query) {
+        return expression;
+    }
+    String add = "query.add(" + expression + ");\n";
+    if (arguments.isEmpty()) {
+        return "        " + add;
+    }
+    String condition = String.join(" != null && ", arguments) + " != null";
+    return "        if (" + condition + ") {\n            " + add + "        }\n";
+}
+
 private static void appendResponse(StringBuilder java, List<ResponseRecord> responses,
                                    String name, String methodName) {
     var root = responses.stream().filter(response -> response.name() == null).toList();
@@ -318,7 +341,7 @@ private static void appendResponse(StringBuilder java, List<ResponseRecord> resp
         throw new IllegalArgumentException("Expected one unnamed @response for " + methodName);
     }
     java.append("\n    public record ").append(name).append("(")
-            .append(root.get(0).components()).append(") {");
+            .append(root.getFirst().components()).append(") {");
     if (responses.size() > 1) {
         java.append('\n');
         var nestedNames = new HashSet<>(Set.of(name));
