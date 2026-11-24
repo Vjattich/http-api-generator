@@ -145,7 +145,6 @@ private static String generate(String className, List<Endpoint> endpoints,
             import java.util.List;
             import java.util.Map;
             import java.util.Objects;
-            import java.util.StringJoiner;
             
             """);
     boolean typedResponses = endpoints.stream().anyMatch(endpoint -> endpoint.jsonResponse() != null);
@@ -172,8 +171,9 @@ private static String generate(String className, List<Endpoint> endpoints,
     var names = new HashSet<>(Set.of("variable", "encode", "hashCode", "toString", "clone",
             "finalize", "getClass", "notify", "notifyAll", "wait"));
     var typeNames = new HashSet<>(Set.of(className));
+    boolean needsQueryEncoder = false;
     for (Endpoint endpoint : endpoints) {
-        appendEndpoint(java, endpoint, names, typeNames, instanceVariables, instanceUris);
+        needsQueryEncoder |= appendEndpoint(java, endpoint, names, typeNames, instanceVariables, instanceUris);
     }
     var assignments = new StringBuilder();
     instanceUris.forEach((url, field) -> assignments.append("        this.").append(field)
@@ -181,6 +181,49 @@ private static String generate(String className, List<Endpoint> endpoints,
     java.insert(constructorEnd, assignments);
     if (typedResponses) {
         java.append(responseParser());
+    }
+    if (needsQueryEncoder) {
+        java.append("""
+
+                private static void appendQueryValue(StringBuilder url, String value) {
+                    int valueStart = url.length();
+                    int start = 0;
+                    for (int i = 0; i < value.length(); i++) {
+                        char c = value.charAt(i);
+                        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                                || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '*') continue;
+                        url.append(value, start, i);
+                        if (c == ' ') {
+                            url.append("%20");
+                        } else {
+                            int cp = value.codePointAt(i);
+                            if (Character.isSupplementaryCodePoint(cp)) {
+                                i++;
+                                appendQueryByte(url, 0xf0 | cp >> 18);
+                                appendQueryByte(url, 0x80 | (cp >> 12 & 63));
+                                appendQueryByte(url, 0x80 | (cp >> 6 & 63));
+                            } else if (Character.isSurrogate(c)) {
+                                url.setLength(valueStart);
+                                url.append(encode(value).replace("+", "%20"));
+                                return;
+                            } else if (cp >= 0x800) {
+                                appendQueryByte(url, 0xe0 | cp >> 12);
+                                appendQueryByte(url, 0x80 | (cp >> 6 & 63));
+                            } else if (cp >= 0x80) {
+                                appendQueryByte(url, 0xc0 | cp >> 6);
+                            }
+                            appendQueryByte(url, cp < 128 ? cp : 0x80 | (cp & 63));
+                        }
+                        start = i + 1;
+                    }
+                    url.append(value, start, value.length());
+                }
+
+                private static void appendQueryByte(StringBuilder url, int b) {
+                    String hex = "0123456789ABCDEF";
+                    url.append('%').append(hex.charAt(b >> 4)).append(hex.charAt(b & 15));
+                }
+            """);
     }
     return java.append("""
             
@@ -199,7 +242,7 @@ private static String generate(String className, List<Endpoint> endpoints,
             """).toString();
 }
 
-private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<String> names,
+private static boolean appendEndpoint(StringBuilder java, Endpoint endpoint, Set<String> names,
                                    Set<String> typeNames, Set<String> instanceVariables,
                                    Map<String, String> instanceUris) {
     String label = endpoint.title().isBlank() ? endpoint.method() + " " + endpoint.url() : endpoint.title();
@@ -217,6 +260,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     var params = new ArrayList<String>();
     var fieldParameters = new LinkedHashMap<String, String>();
     var queryFields = new ArrayList<String>();
+    var fixedQueryFields = new ArrayList<String>();
     var fields = new ArrayList<String>();
     var paramNames = new HashSet<>(Set.of("clone", "finalize", "getClass", "hashCode",
             "notify", "notifyAll", "toString", "wait"));
@@ -226,6 +270,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     String urlWithoutFragment = fragmentIndex < 0 ? url : url.substring(0, fragmentIndex);
     int queryIndex = urlWithoutFragment.indexOf('?');
     String baseUrl = url;
+    boolean mayHaveEmptyField = false;
     if (queryIndex >= 0) {
         baseUrl = urlWithoutFragment.substring(0, queryIndex);
         for (String field : urlWithoutFragment.substring(queryIndex + 1).split("&")) {
@@ -233,11 +278,14 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
                 continue;
             }
             queryFields.add(parameterField(field, params, paramNames, fieldParameters, true));
+            if (!VARIABLE.matcher(field).find()) fixedQueryFields.add(field);
+            mayHaveEmptyField |= VARIABLE.matcher(field).replaceAll("").isEmpty();
         }
         if (queryFields.isEmpty()) {
             baseUrl = url;
         }
     }
+    var queryParameters = List.copyOf(fieldParameters.values());
     String publisher = "HttpRequest.BodyPublishers.noBody()";
     if (form && !endpoint.body().isEmpty()) {
         for (String field : endpoint.body().split("&", -1)) {
@@ -251,6 +299,7 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
         publisher = "HttpRequest.BodyPublishers.ofString(arguments." + parameter + "())";
     }
     boolean typedResponse = endpoint.jsonResponse() != null;
+    boolean reusableRequest = params.isEmpty() && endpoint.body().isEmpty();
     String responseType = endpoint.responses().isEmpty() && !typedResponse ? null
             : unique(capitalize(methodName) + "Response", typeNames);
     boolean variableUrl = VARIABLE.matcher(baseUrl).find();
@@ -267,8 +316,12 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
             java.append("\n    private final URI ").append(uriField).append(";\n");
         }
     } else if (variableUrl) {
-        uriField = methodName + "Uri";
-        java.append("\n    private volatile URI ").append(uriField).append(";\n");
+        if (reusableRequest) {
+            uriField = uriExpression;
+        } else {
+            uriField = methodName + "Uri";
+            java.append("\n    private volatile URI ").append(uriField).append(";\n");
+        }
     } else {
         java.append("\n    private static final URI ").append(uriField)
                 .append(" = ").append(uriExpression).append(";\n");
@@ -279,18 +332,11 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
         appendJsonResponse(java, responseType, endpoint.jsonResponse());
     } else if (responseType != null) {
         appendResponse(java, endpoint.responses(), responseType, methodName);
-        java.append("\n    /**\n")
-                .append("     * @return the HTTP response. A successful JSON body has the shape of {@link ")
-                .append(responseType).append("}.\n")
-                .append("     */");
     }
-    java.append("\n    public ").append(typedResponse ? responseType : "HttpResponse<String>")
-            .append(" ").append(methodName).append("(")
-            .append(recordName).append(" arguments) throws IOException, InterruptedException {\n");
-    java.append("        Objects.requireNonNull(arguments);\n");
+    StringBuilder requestCode = new StringBuilder();
     String requestUri = uriField;
-    if (variableUrl && !instanceUrl) {
-        java.append("        URI uri = ").append(uriField).append(";\n")
+    if (variableUrl && !instanceUrl && !reusableRequest) {
+        requestCode.append("        URI uri = ").append(uriField).append(";\n")
                 .append("        if (uri == null) {\n")
                 .append("            uri = ").append(uriExpression).append(";\n")
                 .append("            ").append(uriField).append(" = uri;\n")
@@ -298,24 +344,67 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
         requestUri = "uri";
     }
     if (!queryFields.isEmpty()) {
-        java.append("        StringJoiner query = new StringJoiner(\"&\");\n");
-        queryFields.forEach(java::append);
-        String suffix = fragment.isEmpty() ? "" : " + " + template(fragment, true);
-        java.append("        URI requestUri = query.length() == 0")
-                .append(fragment.isEmpty() ? " ? " + requestUri : " ? URI.create(" + requestUri + suffix + ")")
-                .append("\n                : URI.create(").append(requestUri)
-                .append(" + \"?\" + query").append(suffix).append(");\n");
+        String fallback = queryParameters.isEmpty() || variableUrl || VARIABLE.matcher(fragment).find()
+                ? null : appendDefaultUri(java, uriField, baseUrl, fixedQueryFields, fragment);
+        if (fallback != null) {
+            String absent = String.join(" && ", queryParameters.stream()
+                    .map(p -> "arguments." + p + "() == null").toList());
+            requestCode.append("        URI requestUri;\n        if (").append(absent).append(") {\n")
+                    .append("            requestUri = ").append(fallback).append(";\n        } else {\n");
+        }
+        var dynamic = new StringBuilder();
+        dynamic.append("        String base = ").append(requestUri).append(".toString();\n")
+                .append("        int baseLength = base.length();\n")
+                .append("        StringBuilder url = new StringBuilder(baseLength + ")
+                .append(url.length() - baseUrl.length()).append(").append(base);\n");
+        queryFields.forEach(dynamic::append);
+        if (mayHaveEmptyField) {
+            dynamic.append("        if (url.length() == baseLength + 1) url.setLength(baseLength);\n");
+        }
+        if (!fragment.isEmpty()) {
+            dynamic.append("        url.append(").append(template(fragment, true)).append(");\n");
+        }
+        dynamic.append(fallback == null ? "        URI requestUri = " : "        requestUri = ");
+        if (fragment.isEmpty()) dynamic.append("url.length() == baseLength ? ").append(requestUri).append(" : ");
+        dynamic.append("URI.create(url.toString());\n");
+        if (fallback == null) requestCode.append(dynamic);
+        else requestCode.append(dynamic.toString().indent(4)).append("        }\n");
         requestUri = "requestUri";
     }
-    java.append("        HttpRequest request = HttpRequest.newBuilder(")
+    requestCode.append("        HttpRequest request = HttpRequest.newBuilder(")
             .append(requestUri).append(")\n");
     for (String header : endpoint.headers()) {
         int colon = header.indexOf(':');
-        java.append("                .header(").append(literal(header.substring(0, colon).strip()))
+        requestCode.append("                .header(").append(literal(header.substring(0, colon).strip()))
                 .append(", ").append(template(header.substring(colon + 1).strip(), false)).append(")\n");
     }
-    java.append("                .method(").append(literal(endpoint.method())).append(", ")
+    requestCode.append("                .method(").append(literal(endpoint.method())).append(", ")
             .append(publisher).append(")\n                .build();\n");
+    if (reusableRequest) {
+        String field = methodName + "Request";
+        java.append("\n    private volatile HttpRequest ").append(field).append(";\n")
+                .append("\n    private HttpRequest ").append(methodName).append("() {\n")
+                .append("        HttpRequest cached = ").append(field).append(";\n")
+                .append("        if (cached != null) return cached;\n")
+                .append(requestCode)
+                .append("        ").append(field).append(" = request;\n")
+                .append("        return request;\n    }\n");
+    }
+    if (!typedResponse && responseType != null) {
+        java.append("\n    /**\n")
+                .append("     * @return the HTTP response. A successful JSON body has the shape of {@link ")
+                .append(responseType).append("}.\n")
+                .append("     */");
+    }
+    java.append("\n    public ").append(typedResponse ? responseType : "HttpResponse<String>")
+            .append(" ").append(methodName).append("(")
+            .append(recordName).append(" arguments) throws IOException, InterruptedException {\n")
+            .append("        Objects.requireNonNull(arguments);\n");
+    if (reusableRequest) {
+        java.append("        HttpRequest request = ").append(methodName).append("();\n");
+    } else {
+        java.append(requestCode);
+    }
     if (typedResponse) {
         java.append("""
                         var response = client.send(request, HttpResponse.BodyHandlers.ofString());
@@ -337,17 +426,36 @@ private static void appendEndpoint(StringBuilder java, Endpoint endpoint, Set<St
     } else {
         java.append("        return client.send(request, HttpResponse.BodyHandlers.ofString());\n    }\n");
     }
+    return !queryParameters.isEmpty();
+}
+
+private static String appendDefaultUri(StringBuilder java, String uriField, String baseUrl,
+                                       List<String> fixedFields, String fragment) {
+    if (fixedFields.isEmpty() && fragment.isEmpty()) return uriField;
+    String url = baseUrl + (fixedFields.isEmpty() ? "" : "?" + String.join("&", fixedFields)) + fragment;
+    try {
+        URI.create(url);
+    } catch (IllegalArgumentException invalidLiteral) {
+        // Leave validation on the request path so unrelated endpoints remain usable.
+        return null;
+    }
+    String field = uriField + "_WITHOUT_ARGUMENTS";
+    java.append("\n    private static final URI ").append(field).append(" = URI.create(")
+            .append(literal(url)).append(");\n");
+    return field;
 }
 
 private static String parameterField(String field, List<String> params, Set<String> paramNames,
                                      Map<String, String> fieldParameters, boolean query) {
     var matcher = VARIABLE.matcher(field);
     var expressions = new ArrayList<String>();
+    var writes = new ArrayList<String>();
     var arguments = new LinkedHashSet<String>();
     int end = 0;
     while (matcher.find()) {
         if (matcher.start() > end) {
             expressions.add(literal(field.substring(end, matcher.start())));
+            writes.add("url.append(" + expressions.getLast() + ");");
         }
         String variable = matcher.group(1);
         String base = SourceVersion.isIdentifier(variable) && !SourceVersion.isKeyword(variable)
@@ -360,22 +468,22 @@ private static String parameterField(String field, List<String> params, Set<Stri
         String argument = "arguments." + parameter + "()";
         arguments.add(argument);
         String encoded = "encode(" + argument + ")";
-        expressions.add(query ? encoded + ".replace(\"+\", \"%20\")" : encoded);
+        expressions.add(encoded);
+        writes.add("appendQueryValue(url, " + argument + ");");
         end = matcher.end();
     }
     if (end < field.length() || expressions.isEmpty()) {
         expressions.add(literal(field.substring(end)));
+        writes.add("url.append(" + expressions.getLast() + ");");
     }
     String expression = String.join(" + ", expressions);
     if (!query) {
         return expression;
     }
-    String add = "query.add(" + expression + ");\n";
-    if (arguments.isEmpty()) {
-        return "        " + add;
-    }
+    writes.addFirst("url.append(url.length() == baseLength ? '?' : '&');");
+    if (arguments.isEmpty()) return String.join("\n", writes).indent(8);
     String condition = String.join(" != null && ", arguments) + " != null";
-    return "        if (" + condition + ") {\n            " + add + "        }\n";
+    return "        if (" + condition + ") {\n" + String.join("\n", writes).indent(12) + "        }\n";
 }
 
 private static void appendResponse(StringBuilder java, List<ResponseRecord> responses,
@@ -476,8 +584,7 @@ private static void appendJsonRecord(StringBuilder java, StringBuilder nested, S
     });
     java.append(indent).append("                }\n")
             .append(indent).append("                json.skipValue();\n")
-            .append(indent).append("            } while (json.take(','));\n")
-            .append(indent).append("            json.expect('}');\n")
+            .append(indent).append("            } while (json.more('}'));\n")
             .append(indent).append("        }\n")
             .append(indent).append("        return new ").append(name).append("(")
             .append(String.join(", ", locals)).append(");\n")
@@ -571,13 +678,28 @@ private static class ResponseJson {
     }
 
     long longValue() {
-        // The generated null check has already consumed leading whitespace.
         int start = position;
-        integerPart();
+        boolean negative = position < input.length() && input.charAt(position) == '-';
+        if (negative) position++;
+        int first = position;
+        long value = 0;
+        if (position < input.length() && input.charAt(position) == '0') {
+            position++;
+        } else {
+            while (position < input.length()) {
+                int digit = input.charAt(position) - '0';
+                if (digit < 0 || digit > 9) break;
+                value = value * 10 + digit;
+                position++;
+            }
+            if (position == first) throw invalid();
+        }
         if (numberSuffix()) {
             return new java.math.BigDecimal(input.substring(start, position)).longValueExact();
         }
-        return Long.parseLong(input, start, position, 10);
+        // Up to 18 digits always fit. Delegate boundary and overflow checks for longer tokens.
+        if (position - first > 18) return Long.parseLong(input, start, position, 10);
+        return negative ? -value : value;
     }
 
     int keyHash() {
@@ -662,12 +784,21 @@ private static class ResponseJson {
     }
 
     void whitespace() {
-        while (position < input.length() && " \t\r\n".indexOf(input.charAt(position)) >= 0) position++;
+        while (position < input.length()) {
+            char c = input.charAt(position);
+            if (c > ' ' || (c != ' ' && c != '\t' && c != '\r' && c != '\n')) return;
+            position++;
+        }
     }
 
     boolean take(char c) {
-        whitespace();
-        if (position == input.length() || input.charAt(position) != c) return false;
+        if (position == input.length()) return false;
+        char current = input.charAt(position);
+        if (current != c) {
+            if (current > ' ') return false;
+            whitespace();
+            if (position == input.length() || input.charAt(position) != c) return false;
+        }
         position++;
         return true;
     }
@@ -676,13 +807,22 @@ private static class ResponseJson {
         if (!take(c)) throw invalid();
     }
 
+    boolean more(char end) {
+        whitespace();
+        if (position == input.length()) throw invalid();
+        char c = input.charAt(position++);
+        if (c == ',') return true;
+        if (c == end) return false;
+        throw invalid();
+    }
+
     IllegalArgumentException invalid() {
         return new IllegalArgumentException("Invalid JSON at character " + position);
     }
 
     boolean nullValue() {
         whitespace();
-        if (!input.startsWith("null", position)) return false;
+        if (position == input.length() || input.charAt(position) != 'n') return false;
         keyword("null", null);
         return true;
     }
@@ -690,7 +830,7 @@ private static class ResponseJson {
     boolean bool() {
         whitespace();
         if (input.startsWith("true", position)) {
-            keyword("true", true);
+            position += 4;
             return true;
         }
         keyword("false", false);
@@ -708,8 +848,7 @@ private static class ResponseJson {
         if (take(']')) return items;
         do {
             items.add(readItem.get());
-        } while (take(','));
-        expect(']');
+        } while (more(']'));
         return items;
     }
 
@@ -718,22 +857,20 @@ private static class ResponseJson {
         if (position == input.length()) throw invalid();
         switch (input.charAt(position)) {
             case '{' -> {
-                expect('{');
+                position++;
                 if (take('}')) return;
                 do {
                     readString(false);
                     expect(':');
                     skipValue();
-                } while (take(','));
-                expect('}');
+                } while (more('}'));
             }
             case '[' -> {
-                expect('[');
+                position++;
                 if (take(']')) return;
                 do {
                     skipValue();
-                } while (take(','));
-                expect(']');
+                } while (more(']'));
             }
             case '"' -> readString(false);
             case 't', 'f' -> bool();
