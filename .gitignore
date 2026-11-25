@@ -30,3 +30,5 @@ bin/
 .DS_Store
 /BuildApi.iml
 /.idea/
+/benchmarks/httpbin/api.jfr
+/benchmarks/httpbin/api-steady.jfr
