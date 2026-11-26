@@ -18,7 +18,7 @@ private record Endpoint(String title, String method, String url,
                         Map<String, Object> jsonResponse) {
 }
 
-private record SharedShape(String name, Map<String, Object> sample) {
+private record SharedShape(String name, String codecName, Map<String, Object> sample) {
 }
 
 private record EndpointFlags(boolean queryEncoder, boolean formBuffer, boolean jsonBuffer) {
@@ -147,7 +147,10 @@ private static boolean isResponseHandler(String line) {
 private static String generate(String className, List<Endpoint> endpoints,
                                Set<String> declaredVariables,
                                Set<String> instanceVariables) throws IOException {
-    var body = new StringBuilder();
+    var publicApi = new StringBuilder();
+    var privateFields = new StringBuilder();
+    var privateMethods = new StringBuilder();
+    var privateCodecs = new StringBuilder();
     var instanceUris = new LinkedHashMap<String, String>();
     var ctorInits = new StringBuilder();
     var names = new HashSet<>(Set.of("variable", "encode", "headersOf", "isUrlSafe",
@@ -158,21 +161,21 @@ private static String generate(String className, List<Endpoint> endpoints,
             "List", "Map", "Object", "String", "Long", "Boolean", "BigDecimal"));
 
     var sharedShapes = collectSharedShapes(endpoints, typeNames);
-    var sharedTypeNames = new LinkedHashMap<String, String>();
-    sharedShapes.forEach((sig, shape) -> sharedTypeNames.put(sig, shape.name()));
 
     boolean needsQueryEncoder = false;
     boolean needsFormBuffer = false;
     boolean needsJsonBuffer = false;
     for (Endpoint endpoint : endpoints) {
-        var flags = appendEndpoint(body, endpoint, names, typeNames, declaredVariables,
-                instanceVariables, instanceUris, ctorInits, sharedTypeNames);
+        var flags = appendEndpoint(publicApi, privateFields, privateMethods, privateCodecs,
+                endpoint, names, typeNames, declaredVariables,
+                instanceVariables, instanceUris, ctorInits, sharedShapes);
         needsQueryEncoder |= flags.queryEncoder();
         needsFormBuffer |= flags.formBuffer();
         needsJsonBuffer |= flags.jsonBuffer();
     }
     for (SharedShape shape : sharedShapes.values()) {
-        appendJsonResponse(body, shape.name(), shape.sample(), sharedTypeNames, false);
+        appendJsonResponse(publicApi, privateCodecs, typeNames,
+                shape.name(), shape.codecName(), shape.sample(), sharedShapes, false);
     }
 
     boolean typedResponses = endpoints.stream().anyMatch(endpoint -> endpoint.jsonResponse() != null);
@@ -205,12 +208,6 @@ private static String generate(String className, List<Endpoint> endpoints,
                 """);
     }
     java.append("\npublic final class ").append(className).append(" {\n");
-    java.append("""
-                private static final HttpHeaders EMPTY_HEADERS = HttpHeaders.of(Map.of(), (k, v) -> true);
-                private final HttpClient client;
-                private final Map<String, String> variables;
-            
-            """);
     java.append("    public ").append(className).append("(Map<String, String> variables) {\n");
     java.append("        this(HttpClient.newHttpClient(), variables);\n    }\n\n");
     java.append("    public ").append(className).append("(HttpClient client, Map<String, String> variables) {\n");
@@ -222,7 +219,18 @@ private static String generate(String className, List<Endpoint> endpoints,
             .append(" = URI.create(").append(template(url, true)).append(");\n"));
     java.append(ctorInits);
     java.append("    }\n");
-    java.append(body);
+    java.append(publicApi);
+    java.append("""
+
+                // Internal implementation
+
+                private static final HttpHeaders EMPTY_HEADERS = HttpHeaders.of(Map.of(), (k, v) -> true);
+                private final HttpClient client;
+                private final Map<String, String> variables;
+            """);
+    java.append(privateFields);
+    java.append(privateMethods);
+    java.append(privateCodecs);
     java.append("""
 
                 private static final class FastRequest extends HttpRequest {
@@ -702,7 +710,8 @@ private static Map<String, SharedShape> collectSharedShapes(List<Endpoint> endpo
     counts.forEach((sig, count) -> {
         if (count > 1) {
             String name = unique(labels.get(sig), typeNames);
-            shared.put(sig, new SharedShape(name, samples.get(sig)));
+            String codecName = unique(name + "Codec", typeNames);
+            shared.put(sig, new SharedShape(name, codecName, samples.get(sig)));
         }
     });
     return shared;
@@ -764,12 +773,14 @@ private static int authorityEnd(String value) {
     return end;
 }
 
-private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoint, Set<String> names,
+private static EndpointFlags appendEndpoint(StringBuilder publicApi, StringBuilder privateFields,
+                                            StringBuilder privateMethods, StringBuilder privateCodecs,
+                                            Endpoint endpoint, Set<String> names,
                                             Set<String> typeNames, Set<String> declaredVariables,
                                             Set<String> instanceVariables,
                                             Map<String, String> instanceUris,
                                             StringBuilder ctorInits,
-                                            Map<String, String> sharedTypeNames) {
+                                            Map<String, SharedShape> sharedShapes) {
     String label = endpoint.title().isBlank() ? endpoint.method() + " " + endpoint.url() : endpoint.title();
     String methodName = unique(identifier(label), names);
     String asyncMethodName = unique(methodName + "Async", names);
@@ -808,17 +819,17 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
         headersExpr = "EMPTY_HEADERS";
     } else if (!anyHeaderVariable) {
         String field = constPrefix + "_HEADERS";
-        java.append("\n    private static final HttpHeaders ").append(field)
+        privateFields.append("\n    private static final HttpHeaders ").append(field)
                 .append(" = ").append(headersInitExpr).append(";\n");
         headersExpr = field;
     } else if (allHeaderVarsInstance) {
         String field = methodName + "Headers";
-        java.append("\n    private final HttpHeaders ").append(field).append(";\n");
+        privateFields.append("\n    private final HttpHeaders ").append(field).append(";\n");
         ctorInits.append("        this.").append(field).append(" = ").append(headersInitExpr).append(";\n");
         headersExpr = field;
     } else {
         lazyHeadersField = methodName + "Headers";
-        java.append("\n    private volatile HttpHeaders ").append(lazyHeadersField).append(";\n");
+        privateFields.append("\n    private volatile HttpHeaders ").append(lazyHeadersField).append(";\n");
         headersExpr = "_hdrs";
     }
 
@@ -923,6 +934,7 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
     boolean reusableRequest = params.isEmpty() && staticOrNoBody;
     String responseType = endpoint.responses().isEmpty() && !typedResponse ? null
             : unique(capitalize(methodName) + "Response", typeNames);
+    String responseCodec = typedResponse ? unique(responseType + "Codec", typeNames) : null;
     boolean variableUrl = !hasPathParams && baseHasConfigVar;
     boolean instanceUrl = variableUrl && allBaseConfigVarsInstance;
     String uriField = constPrefix + "_URI";
@@ -933,48 +945,50 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
             if (uriField == null) {
                 uriField = methodName + "Uri";
                 instanceUris.put(baseUrl, uriField);
-                java.append("\n    private final URI ").append(uriField).append(";\n");
+                privateFields.append("\n    private final URI ").append(uriField).append(";\n");
             }
         } else if (variableUrl) {
             if (reusableRequest) {
                 uriField = uriExpression;
             } else {
                 uriField = methodName + "Uri";
-                java.append("\n    private volatile URI ").append(uriField).append(";\n");
+                privateFields.append("\n    private volatile URI ").append(uriField).append(";\n");
             }
         } else {
-            java.append("\n    private static final URI ").append(uriField)
+            privateFields.append("\n    private static final URI ").append(uriField)
                     .append(" = ").append(uriExpression).append(";\n");
         }
     }
     if (staticBodyField != null) {
-        java.append("\n    private static final Optional<HttpRequest.BodyPublisher> ").append(staticBodyField)
+        privateFields.append("\n    private static final Optional<HttpRequest.BodyPublisher> ").append(staticBodyField)
                 .append(" = Optional.of(HttpRequest.BodyPublishers.ofByteArray(")
                 .append(literal(endpoint.body())).append(".getBytes(StandardCharsets.UTF_8)));\n");
     }
-    java.append("\n    public record ").append(recordName).append("(")
+
+    publicApi.append("\n    public record ").append(recordName).append("(")
             .append(String.join(", ", params)).append(") {}\n");
     if (typedResponse) {
-        appendJsonResponse(java, responseType, endpoint.jsonResponse(), sharedTypeNames, true);
+        appendJsonResponse(publicApi, privateCodecs, typeNames,
+                responseType, responseCodec, endpoint.jsonResponse(), sharedShapes, true);
     } else if (responseType != null) {
-        appendResponse(java, endpoint.responses(), responseType, methodName);
+        appendResponse(publicApi, endpoint.responses(), responseType, methodName);
     }
 
     String defaultRequestExpr = null;
     String fallback = !hasPathParams && !queryFields.isEmpty() && !queryParameters.isEmpty()
                       && !variableUrl && !VARIABLE.matcher(fragment).find()
-            ? appendDefaultUri(java, uriField, baseUrl, fixedQueryFields, fragment) : null;
+            ? appendDefaultUri(privateFields, uriField, baseUrl, fixedQueryFields, fragment) : null;
     if (fallback != null && staticOrNoBody && !usesFormBuffer && !usesJsonBuffer) {
         if (!anyHeaderVariable) {
             String field = constPrefix + "_DEFAULT_REQUEST";
-            java.append("\n    private static final HttpRequest ").append(field)
+            privateFields.append("\n    private static final HttpRequest ").append(field)
                     .append(" = new FastRequest(").append(fallback).append(", ")
                     .append(literal(endpoint.method())).append(", ").append(headersExpr)
                     .append(", ").append(bodyOptionalExpr).append(");\n");
             defaultRequestExpr = field;
         } else if (allHeaderVarsInstance) {
             String field = methodName + "DefaultRequest";
-            java.append("\n    private final HttpRequest ").append(field).append(";\n");
+            privateFields.append("\n    private final HttpRequest ").append(field).append(";\n");
             ctorInits.append("        this.").append(field).append(" = new FastRequest(")
                     .append(fallback).append(", ").append(literal(endpoint.method())).append(", ")
                     .append(headersExpr).append(", ").append(bodyOptionalExpr).append(");\n");
@@ -1013,7 +1027,7 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
             singleQueryPrefixField = constPrefix + "_QUERY_PREFIX";
             singleQuerySuffix = after.toString();
             singleQueryParam = queryParameters.getFirst();
-            java.append("\n    private static final String ").append(singleQueryPrefixField)
+            privateFields.append("\n    private static final String ").append(singleQueryPrefixField)
                     .append(" = ").append(literal(before.toString())).append(";\n");
         }
     }
@@ -1028,11 +1042,11 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
             singlePathSuffix = suffixRaw;
             if (!VARIABLE.matcher(prefixRaw).find()) {
                 singlePathPrefixField = constPrefix + "_PATH_PREFIX";
-                java.append("\n    private static final String ").append(singlePathPrefixField)
+                privateFields.append("\n    private static final String ").append(singlePathPrefixField)
                         .append(" = ").append(literal(prefixRaw)).append(";\n");
             } else {
                 singlePathPrefixField = methodName + "PathPrefix";
-                java.append("\n    private final String ").append(singlePathPrefixField).append(";\n");
+                privateFields.append("\n    private final String ").append(singlePathPrefixField).append(";\n");
                 ctorInits.append("        this.").append(singlePathPrefixField).append(" = ")
                         .append(template(prefixRaw, true)).append(";\n");
             }
@@ -1212,39 +1226,86 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
     if (reusableRequest) {
         if (!variableUrl && !anyHeaderVariable) {
             cachedRequestExpr = constPrefix + "_REQUEST";
-            java.append("\n    private static final HttpRequest ").append(cachedRequestExpr)
+            privateFields.append("\n    private static final HttpRequest ").append(cachedRequestExpr)
                     .append(" = new FastRequest(").append(uriField).append(", ")
                     .append(literal(endpoint.method())).append(", ").append(headersExpr)
                     .append(", ").append(bodyOptionalExpr).append(");\n");
         } else if ((!variableUrl || instanceUrl) && (!anyHeaderVariable || allHeaderVarsInstance)) {
             cachedRequestExpr = methodName + "Request";
-            java.append("\n    private final HttpRequest ").append(cachedRequestExpr).append(";\n");
+            privateFields.append("\n    private final HttpRequest ").append(cachedRequestExpr).append(";\n");
             ctorInits.append("        this.").append(cachedRequestExpr).append(" = new FastRequest(")
                     .append(uriField).append(", ").append(literal(endpoint.method())).append(", ")
                     .append(headersExpr).append(", ").append(bodyOptionalExpr).append(");\n");
         } else {
-            java.append("\n    private volatile HttpRequest ").append(methodName).append("Request;\n");
+            privateFields.append("\n    private volatile HttpRequest ").append(methodName).append("Request;\n");
         }
     }
 
-    java.append("\n    private HttpRequest ").append(buildHelperName).append("(")
+    String unpackArgs = String.join(", ", paramList.stream().map(p -> "arguments." + p + "()").toList());
+    String forwardArgs = String.join(", ", paramList);
+
+    if (!typedResponse && responseType != null) {
+        publicApi.append("\n    /**\n")
+                .append("     * @return the HTTP response. A successful JSON body has the shape of {@link ")
+                .append(responseType).append("}.\n")
+                .append("     */");
+    }
+    publicApi.append("\n    public ").append(returnType).append(" ").append(methodName).append("(")
+            .append(recordName).append(" arguments) throws IOException, InterruptedException {\n")
+            .append("        Objects.requireNonNull(arguments);\n")
+            .append("        return ").append(methodName).append("(").append(unpackArgs).append(");\n    }\n");
+
+    publicApi.append("\n    public CompletableFuture<").append(returnType).append("> ").append(asyncMethodName)
+            .append("(").append(recordName).append(" arguments) {\n")
+            .append("        Objects.requireNonNull(arguments);\n")
+            .append("        return ").append(asyncMethodName).append("(").append(unpackArgs).append(");\n    }\n");
+
+    privateMethods.append("\n    private ").append(returnType).append(" ").append(methodName).append("(")
+            .append(String.join(", ", params)).append(") throws IOException, InterruptedException {\n");
+    if (typedResponse) {
+        privateMethods.append("        return ").append(parseHelperName).append("(client.send(")
+                .append(buildHelperName).append("(").append(forwardArgs)
+                .append("), ").append(responseCodec).append(".BODY_HANDLER));\n    }\n");
+    } else {
+        privateMethods.append("        return client.send(").append(buildHelperName).append("(").append(forwardArgs)
+                .append("), HttpResponse.BodyHandlers.ofString());\n    }\n");
+    }
+
+    privateMethods.append("\n    private CompletableFuture<").append(returnType).append("> ").append(asyncMethodName)
+            .append("(").append(String.join(", ", params)).append(") {\n");
+    if (typedResponse) {
+        privateMethods.append("        return client.sendAsync(").append(buildHelperName).append("(").append(forwardArgs)
+                .append("), ").append(responseCodec).append(".BODY_HANDLER)\n")
+                .append("                .thenApply(_res -> {\n")
+                .append("                    try {\n")
+                .append("                        return ").append(parseHelperName).append("(_res);\n")
+                .append("                    } catch (IOException e) {\n")
+                .append("                        throw new CompletionException(e);\n")
+                .append("                    }\n")
+                .append("                });\n    }\n");
+    } else {
+        privateMethods.append("        return client.sendAsync(").append(buildHelperName).append("(").append(forwardArgs)
+                .append("), HttpResponse.BodyHandlers.ofString());\n    }\n");
+    }
+
+    privateMethods.append("\n    private HttpRequest ").append(buildHelperName).append("(")
             .append(String.join(", ", params)).append(") {\n");
     if (cachedRequestExpr != null) {
-        java.append("        return ").append(cachedRequestExpr).append(";\n");
+        privateMethods.append("        return ").append(cachedRequestExpr).append(";\n");
     } else if (reusableRequest) {
         String field = methodName + "Request";
-        java.append("        HttpRequest _req = ").append(field).append(";\n")
+        privateMethods.append("        HttpRequest _req = ").append(field).append(";\n")
                 .append("        if (_req != null) return _req;\n")
                 .append(requestCode.toString().replace("return new FastRequest(", "_req = new FastRequest("))
                 .append("        ").append(field).append(" = _req;\n")
                 .append("        return _req;\n");
     } else {
-        java.append(requestCode);
+        privateMethods.append(requestCode);
     }
-    java.append("    }\n");
+    privateMethods.append("    }\n");
 
     if (typedResponse) {
-        java.append("\n    private static ").append(responseType).append(" ").append(parseHelperName)
+        privateMethods.append("\n    private static ").append(responseType).append(" ").append(parseHelperName)
                 .append("(HttpResponse<Object> _res) throws IOException {\n")
                 .append("""
                                 if (_res.statusCode() < 200 || _res.statusCode() >= 300) {
@@ -1268,7 +1329,7 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
                                 try {
                                     var _json = new ResponseJson(_bytes);
                         """)
-                .append("            var _result = ").append(responseType).append(".readJson(_json);\n")
+                .append("            var _result = ").append(responseCodec).append(".readJson(_json);\n")
                 .append("            _json.finish();\n")
                 .append("            return _result;\n")
                 .append("""
@@ -1277,53 +1338,6 @@ private static EndpointFlags appendEndpoint(StringBuilder java, Endpoint endpoin
                                 }
                             }
                         """);
-    }
-
-    String unpackArgs = String.join(", ", paramList.stream().map(p -> "arguments." + p + "()").toList());
-    String forwardArgs = String.join(", ", paramList);
-
-    if (!typedResponse && responseType != null) {
-        java.append("\n    /**\n")
-                .append("     * @return the HTTP response. A successful JSON body has the shape of {@link ")
-                .append(responseType).append("}.\n")
-                .append("     */");
-    }
-    java.append("\n    public ").append(returnType).append(" ").append(methodName).append("(")
-            .append(recordName).append(" arguments) throws IOException, InterruptedException {\n")
-            .append("        Objects.requireNonNull(arguments);\n")
-            .append("        return ").append(methodName).append("(").append(unpackArgs).append(");\n    }\n");
-
-    java.append("\n    private ").append(returnType).append(" ").append(methodName).append("(")
-            .append(String.join(", ", params)).append(") throws IOException, InterruptedException {\n");
-    if (typedResponse) {
-        java.append("        return ").append(parseHelperName).append("(client.send(")
-                .append(buildHelperName).append("(").append(forwardArgs)
-                .append("), ").append(responseType).append(".BODY_HANDLER));\n    }\n");
-    } else {
-        java.append("        return client.send(").append(buildHelperName).append("(").append(forwardArgs)
-                .append("), HttpResponse.BodyHandlers.ofString());\n    }\n");
-    }
-
-    java.append("\n    public CompletableFuture<").append(returnType).append("> ").append(asyncMethodName)
-            .append("(").append(recordName).append(" arguments) {\n")
-            .append("        Objects.requireNonNull(arguments);\n")
-            .append("        return ").append(asyncMethodName).append("(").append(unpackArgs).append(");\n    }\n");
-
-    java.append("\n    private CompletableFuture<").append(returnType).append("> ").append(asyncMethodName)
-            .append("(").append(String.join(", ", params)).append(") {\n");
-    if (typedResponse) {
-        java.append("        return client.sendAsync(").append(buildHelperName).append("(").append(forwardArgs)
-                .append("), ").append(responseType).append(".BODY_HANDLER)\n")
-                .append("                .thenApply(_res -> {\n")
-                .append("                    try {\n")
-                .append("                        return ").append(parseHelperName).append("(_res);\n")
-                .append("                    } catch (IOException e) {\n")
-                .append("                        throw new CompletionException(e);\n")
-                .append("                    }\n")
-                .append("                });\n    }\n");
-    } else {
-        java.append("        return client.sendAsync(").append(buildHelperName).append("(").append(forwardArgs)
-                .append("), HttpResponse.BodyHandlers.ofString());\n    }\n");
     }
 
     return new EndpointFlags(hasPathParams || !queryParameters.isEmpty(), usesFormBuffer, usesJsonBuffer);
@@ -1510,7 +1524,7 @@ private static String responseParser() throws IOException {
             .replaceFirst("class ResponseJson", "final class ResponseJson").indent(4);
 }
 
-private record JsonType(String name, String expr, JsonType element) {
+private record JsonType(String recordType, String codecType, String expr, JsonType element) {
     boolean isList() {
         return element != null;
     }
@@ -1527,21 +1541,28 @@ private static boolean isSimpleAsciiKey(String key) {
     return true;
 }
 
-private static void appendJsonResponse(StringBuilder java, String name, Map<String, Object> sample,
-                                       Map<String, String> sharedTypeNames, boolean withBodyHandler) {
-    var nested = new StringBuilder();
-    var names = new HashSet<>(Set.of("ResponseJson", "FormBuffer", "JsonBuffer", "FastRequest",
+private static void appendJsonResponse(StringBuilder publicRecords, StringBuilder privateCodecs,
+                                       Set<String> topLevelTypeNames,
+                                       String name, String codecName, Map<String, Object> sample,
+                                       Map<String, SharedShape> sharedShapes, boolean withBodyHandler) {
+    var nestedRecords = new StringBuilder();
+    var nestedNames = new HashSet<>(Set.of("ResponseJson", "FormBuffer", "JsonBuffer", "FastRequest",
             "JsonBodySubscriber", "ParseFailure", "BodySub",
             "List", "Map", "Object", "String", "Long", "Boolean", "BigDecimal"));
-    names.add(name);
-    names.addAll(sharedTypeNames.values());
-    appendJsonRecord(java, nested, names, name, sample, "    ", sharedTypeNames, withBodyHandler);
-    java.append(nested).append("    }\n");
+    nestedNames.add(name);
+    sharedShapes.values().forEach(shape -> nestedNames.add(shape.name()));
+    appendJsonRecord(publicRecords, nestedRecords, privateCodecs, nestedNames, topLevelTypeNames,
+            name, name, name, codecName, sample, sharedShapes, withBodyHandler, false);
 }
 
-private static void appendJsonRecord(StringBuilder java, StringBuilder nested, Set<String> names,
-                                     String name, Map<String, Object> sample, String indent,
-                                     Map<String, String> sharedTypeNames, boolean withBodyHandler) {
+private static void appendJsonRecord(StringBuilder publicRecords, StringBuilder nestedRecords,
+                                     StringBuilder privateCodecs, Set<String> nestedNames,
+                                     Set<String> topLevelTypeNames, String rootName, String name,
+                                     String qualifiedName, String codecName, Map<String, Object> sample,
+                                     Map<String, SharedShape> sharedShapes, boolean withBodyHandler,
+                                     boolean isNested) {
+    var childNested = isNested ? new StringBuilder() : nestedRecords;
+    var childCodecs = new StringBuilder();
     var components = new ArrayList<String>();
     var locals = new ArrayList<String>();
     var declarations = new ArrayList<String>();
@@ -1554,20 +1575,22 @@ private static void appendJsonRecord(StringBuilder java, StringBuilder nested, S
     var cases = new LinkedHashMap<Integer, List<String>>();
     var fields = new HashSet<>(Set.of("clone", "finalize", "getClass", "hashCode",
             "notify", "notifyAll", "toString", "wait"));
+    String indent = "    ";
     sample.forEach((key, example) -> {
         int idx = components.size();
         String field = unique(identifier(key.replaceAll("([a-z0-9])([A-Z])", "$1 $2")), fields);
-        JsonType type = jsonType(nested, names, capitalize(field), example, sharedTypeNames);
+        JsonType type = jsonType(childNested, childCodecs, nestedNames, topLevelTypeNames,
+                rootName, capitalize(field), example, sharedShapes);
         String local = "field" + idx;
         String keyConst = "KEY_" + idx;
         boolean fastKey = isSimpleAsciiKey(key);
         String readExpr = type.isList()
                 ? emitListHelper(listHelpers, type, indent + "    ", listCounter) + "(json)"
                 : type.expr();
-        components.add(type.name() + " " + field);
+        components.add(type.recordType() + " " + field);
         locals.add(local);
-        declarations.add(type.name() + " " + local + " = null;");
-        unorderedParams.add(type.name() + " " + local);
+        declarations.add(type.codecType() + " " + local + " = null;");
+        unorderedParams.add(type.codecType() + " " + local);
         if (fastKey) {
             keyConsts.add("private static final byte[] " + keyConst + " = "
                           + literal("\"" + key + "\":") + ".getBytes(StandardCharsets.US_ASCII);");
@@ -1585,13 +1608,27 @@ private static void appendJsonRecord(StringBuilder java, StringBuilder nested, S
                      + indent + "                        continue;\n"
                      + indent + "                    }");
     });
-    java.append('\n').append(indent).append("public record ").append(name).append("(")
-            .append(String.join(", ", components)).append(") {\n");
+
+    if (isNested) {
+        nestedRecords.append("        public record ").append(name).append("(")
+                .append(String.join(", ", components)).append(") {}\n")
+                .append(childNested);
+    } else if (nestedRecords.isEmpty()) {
+        publicRecords.append("\n    public record ").append(name).append("(")
+                .append(String.join(", ", components)).append(") {}\n");
+    } else {
+        publicRecords.append("\n    public record ").append(name).append("(")
+                .append(String.join(", ", components)).append(") {\n")
+                .append(nestedRecords)
+                .append("    }\n");
+    }
+
+    privateCodecs.append('\n').append(indent).append("private static final class ").append(codecName).append(" {\n");
     for (String keyConst : keyConsts) {
-        java.append(indent).append("    ").append(keyConst).append('\n');
+        privateCodecs.append(indent).append("    ").append(keyConst).append('\n');
     }
     if (withBodyHandler) {
-        java.append(indent).append("    private static final HttpResponse.BodyHandler<Object> BODY_HANDLER =\n")
+        privateCodecs.append(indent).append("    private static final HttpResponse.BodyHandler<Object> BODY_HANDLER =\n")
                 .append(indent).append("            info -> info.statusCode() >= 200 && info.statusCode() < 300\n")
                 .append(indent).append("                    ? new BodySub(info.headers())\n")
                 .append(indent).append("                    : HttpResponse.BodySubscribers.replacing(null);\n")
@@ -1612,27 +1649,27 @@ private static void appendJsonRecord(StringBuilder java, StringBuilder nested, S
                 .append(indent).append("                completeExceptionally(t);\n")
                 .append(indent).append("            }\n")
                 .append(indent).append("        }\n")
+                .append(indent).append("    }\n")
+                .append(indent).append("    private static ").append(qualifiedName)
+                .append(" readJson(ResponseJson json) {\n")
+                .append(indent).append("        json.expect('{');\n")
+                .append(indent).append("        return readJsonBody(json);\n")
                 .append(indent).append("    }\n");
     }
-    java.append(indent).append("    private static ").append(name)
-            .append(" readJson(ResponseJson json) {\n")
-            .append(indent).append("        json.expect('{');\n")
-            .append(indent).append("        return readJsonBody(json);\n")
-            .append(indent).append("    }\n")
-            .append(indent).append("    private static ").append(name)
+    privateCodecs.append(indent).append("    private static ").append(qualifiedName)
             .append(" readJsonBody(ResponseJson json) {\n");
     for (String declaration : declarations) {
-        java.append(indent).append("        ").append(declaration).append('\n');
+        privateCodecs.append(indent).append("        ").append(declaration).append('\n');
     }
 
     boolean hasFastKeys = fieldSpecs.stream().anyMatch(FieldSpec::fastKey);
-    java.append(indent).append("        if (!json.take('}')) {\n");
+    privateCodecs.append(indent).append("        if (!json.take('}')) {\n");
     if (hasFastKeys) {
-        java.append(indent).append("            boolean more = true;\n");
+        privateCodecs.append(indent).append("            boolean more = true;\n");
         boolean first = true;
         for (FieldSpec spec : fieldSpecs) {
             if (!spec.fastKey()) continue;
-            java.append(indent).append("            if (")
+            privateCodecs.append(indent).append("            if (")
                     .append(first ? "" : "more && ")
                     .append("json.matchKey(").append(spec.keyConst()).append(")) {\n")
                     .append(indent).append("                ").append(spec.local()).append(" = ")
@@ -1641,54 +1678,55 @@ private static void appendJsonRecord(StringBuilder java, StringBuilder nested, S
                     .append(indent).append("            }\n");
             first = false;
         }
-        java.append(indent).append("            if (more) return readJsonUnordered(json, ")
+        privateCodecs.append(indent).append("            if (more) return readJsonUnordered(json, ")
                 .append(String.join(", ", locals)).append(");\n")
                 .append(indent).append("        }\n")
-                .append(indent).append("        return new ").append(name).append("(")
+                .append(indent).append("        return new ").append(qualifiedName).append("(")
                 .append(String.join(", ", locals)).append(");\n")
                 .append(indent).append("    }\n");
 
-        java.append(indent).append("    private static ").append(name).append(" readJsonUnordered(")
+        privateCodecs.append(indent).append("    private static ").append(qualifiedName).append(" readJsonUnordered(")
                 .append(String.join(", ", unorderedParams)).append(") {\n")
                 .append(indent).append("        do {\n")
                 .append(indent).append("            int hash = json.nextKeyHash();\n")
                 .append(indent).append("            switch (hash) {\n");
         cases.forEach((hash, branches) -> {
-            java.append(indent).append("                case ").append(hash).append(" -> {\n");
+            privateCodecs.append(indent).append("                case ").append(hash).append(" -> {\n");
             for (String branch : branches) {
-                java.append(indent).append("                    ").append(branch).append('\n');
+                privateCodecs.append(indent).append("                    ").append(branch).append('\n');
             }
-            java.append(indent).append("                }\n");
+            privateCodecs.append(indent).append("                }\n");
         });
-        java.append(indent).append("            }\n")
+        privateCodecs.append(indent).append("            }\n")
                 .append(indent).append("            json.skipValue();\n")
                 .append(indent).append("        } while (json.more('}'));\n")
-                .append(indent).append("        return new ").append(name).append("(")
+                .append(indent).append("        return new ").append(qualifiedName).append("(")
                 .append(String.join(", ", locals)).append(");\n")
                 .append(indent).append("    }\n");
     } else {
-        java.append(indent).append("            do {\n")
+        privateCodecs.append(indent).append("            do {\n")
                 .append(indent).append("                int hash = json.nextKeyHash();\n")
                 .append(indent).append("                switch (hash) {\n");
         cases.forEach((hash, branches) -> {
-            java.append(indent).append("                    case ").append(hash).append(" -> {\n");
+            privateCodecs.append(indent).append("                    case ").append(hash).append(" -> {\n");
             for (String branch : branches) {
-                java.append(indent).append("                        ")
+                privateCodecs.append(indent).append("                        ")
                         .append(branch.replace("\n" + indent + "                    ", "\n" + indent + "                        "))
                         .append('\n');
             }
-            java.append(indent).append("                    }\n");
+            privateCodecs.append(indent).append("                    }\n");
         });
-        java.append(indent).append("                }\n")
+        privateCodecs.append(indent).append("                }\n")
                 .append(indent).append("                json.skipValue();\n")
                 .append(indent).append("            } while (json.more('}'));\n")
                 .append(indent).append("        }\n")
-                .append(indent).append("        return new ").append(name).append("(")
+                .append(indent).append("        return new ").append(qualifiedName).append("(")
                 .append(String.join(", ", locals)).append(");\n")
                 .append(indent).append("    }\n");
     }
-    java.append(listHelpers);
-    if (java == nested) java.append(indent).append("}\n");
+    privateCodecs.append(listHelpers);
+    privateCodecs.append(indent).append("}\n");
+    privateCodecs.append(childCodecs);
 }
 
 private static String emitListHelper(StringBuilder out, JsonType listType, String indent, int[] counter) {
@@ -1697,16 +1735,16 @@ private static String emitListHelper(StringBuilder out, JsonType listType, Strin
             ? emitListHelper(out, elem, indent, counter) + "(json)"
             : elem.expr();
     String helper = "readList" + (counter[0]++);
-    out.append(indent).append("private static ").append(listType.name()).append(' ').append(helper)
+    out.append(indent).append("private static ").append(listType.codecType()).append(' ').append(helper)
             .append("(ResponseJson json) {\n")
-            .append(indent).append("    if (!json.take('[')) return json.<").append(listType.name()).append(">expectNull();\n")
+            .append(indent).append("    if (!json.take('[')) return json.<").append(listType.codecType()).append(">expectNull();\n")
             .append(indent).append("    if (json.take(']')) return List.of();\n")
             .append(indent).append("    int firstStart = json.position;\n")
-            .append(indent).append("    ").append(elem.name()).append(" first = ").append(elemRead).append(";\n")
+            .append(indent).append("    ").append(elem.codecType()).append(" first = ").append(elemRead).append(";\n")
             .append(indent).append("    if (!json.more(']')) return Collections.singletonList(first);\n")
             .append(indent).append("    int itemBytes = Math.max(2, json.position - firstStart);\n")
             .append(indent).append("    int est = Math.min(512, Math.max(4, (json.remaining() / itemBytes) + 4));\n")
-            .append(indent).append("    var list = new ArrayList<").append(elem.name()).append(">(est);\n")
+            .append(indent).append("    var list = new ArrayList<").append(elem.codecType()).append(">(est);\n")
             .append(indent).append("    list.add(first);\n")
             .append(indent).append("    do {\n")
             .append(indent).append("        list.add(").append(elemRead).append(");\n")
@@ -1716,35 +1754,40 @@ private static String emitListHelper(StringBuilder out, JsonType listType, Strin
     return helper;
 }
 
-private static JsonType jsonType(StringBuilder nested, Set<String> names,
-                                 String label, Object sample,
-                                 Map<String, String> sharedTypeNames) {
+private static JsonType jsonType(StringBuilder nestedRecords, StringBuilder privateCodecs,
+                                 Set<String> nestedNames, Set<String> topLevelTypeNames,
+                                 String rootName, String label, Object sample,
+                                 Map<String, SharedShape> sharedShapes) {
     return switch (sample) {
         case Map<?, ?> raw -> {
             Map<String, Object> object = ResponseExample.fields(raw);
-            String shared = sharedTypeNames.get(shapeSignature(object));
-            String name;
+            SharedShape shared = sharedShapes.get(shapeSignature(object));
             if (shared != null) {
-                name = shared;
-            } else {
-                name = unique(label, names);
-                appendJsonRecord(nested, nested, names, name, object, "        ", sharedTypeNames, false);
+                yield new JsonType(shared.name(), shared.name(),
+                        "json.take('{') ? " + shared.codecName() + ".readJsonBody(json) : json.<" + shared.name() + ">expectNull()", null);
             }
-            yield new JsonType(name, "json.take('{') ? " + name + ".readJsonBody(json) : json.<" + name + ">expectNull()", null);
+            String name = unique(label, nestedNames);
+            String qualifiedName = rootName + "." + name;
+            String childCodec = unique(rootName + name + "Codec", topLevelTypeNames);
+            appendJsonRecord(nestedRecords, nestedRecords, privateCodecs, nestedNames, topLevelTypeNames,
+                    rootName, name, qualifiedName, childCodec, object, sharedShapes, false, true);
+            yield new JsonType(name, qualifiedName,
+                    "json.take('{') ? " + childCodec + ".readJsonBody(json) : json.<" + qualifiedName + ">expectNull()", null);
         }
         case List<?> list -> {
             if (list.size() != 1 || list.getFirst() == null) {
                 throw new IllegalArgumentException("Use one non-null array example for " + label);
             }
-            JsonType element = jsonType(nested, names, label, list.getFirst(), sharedTypeNames);
-            yield new JsonType("List<" + element.name() + ">", null, element);
+            JsonType element = jsonType(nestedRecords, privateCodecs, nestedNames, topLevelTypeNames,
+                    rootName, label, list.getFirst(), sharedShapes);
+            yield new JsonType("List<" + element.recordType() + ">", "List<" + element.codecType() + ">", null, element);
         }
-        case String ignored -> new JsonType("String", "json.nullableString()", null);
-        case Boolean ignored -> new JsonType("Boolean", "json.nullableBool()", null);
+        case String ignored -> new JsonType("String", "String", "json.nullableString()", null);
+        case Boolean ignored -> new JsonType("Boolean", "Boolean", "json.nullableBool()", null);
         case java.math.BigDecimal number -> number.scale() <= 0 && number.precision() - number.scale() < 19
-                ? new JsonType("Long", "json.nullableLong()", null)
-                : new JsonType("java.math.BigDecimal", "json.nullableDecimal()", null);
-        case null -> new JsonType("Object", "json.nullableRaw()", null);
+                ? new JsonType("Long", "Long", "json.nullableLong()", null)
+                : new JsonType("java.math.BigDecimal", "java.math.BigDecimal", "json.nullableDecimal()", null);
+        case null -> new JsonType("Object", "Object", "json.nullableRaw()", null);
         default -> throw new IllegalArgumentException("Unsupported JSON example for " + label);
     };
 }
